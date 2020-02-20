@@ -1,0 +1,464 @@
+---
+title: 'San Diego AirBnB '
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+Author: Daren Eiri
+Date: 02/12/2020
+
+This notebook presents an analysis of AirBnB data from the San Diego region, along with a machine learning model that recommends price per night based on select criteria.
+
+Going through this exercise gave me an opportunity to refresh my knowledge in R, as well as some basic statistics that I have not really thought about since graduate school!
+
+```{r}
+library(tidyverse)
+library(ggthemes)
+library(GGally)
+library(kableExtra)
+library(RColorBrewer)
+library(leaflet)
+library(leaflet.extras)
+library(glmnet)
+library(caret)
+library(xgboost)
+library(jtools)
+
+th <- theme_fivethirtyeight() + theme(axis.title = element_text(), axis.title.x = element_text()) # global theme for ggplot2 objects
+
+```
+# Load data
+Data is publically available from http://insideairbnb.com/get-the-data.html. 
+
+For this analysis, this dataset was compiled on 21 November, 2019. 
+```{r}
+airbnb <- read.csv("listings.csv", 
+                   encoding="UTF-8", stringsAsFactors = F, na.strings = c(""))
+```
+
+Let's take a quick look at the dataset. We have a lot of columns available. 106 to be exact!
+Based on the column name we should be able to eliminate many of these and focus on a subset of the data to accomplish our goal of predicting the price per night of an AirBnB in San Diego. 
+
+Keep in mind that since this data was scraped in November, the price reflects booking on AirBnB at that time. 
+
+```{r}
+names(airbnb)
+```
+# Feature Selection
+
+For this effort, I've focused our data to 21 features that are more likely going to contribute to our analysis and prediction efforts. With that said, given additional effort, some of the features not included could provide some additional insight into the pricing of these AirBnB locations. 
+```{r}
+features_to_keep <- c("id", "host_is_superhost", "host_since", "host_total_listings_count", "zipcode", 
+                      "latitude", "longitude", "property_type", "room_type", "accommodates", "bathrooms",
+                      "bedrooms", "beds", "square_feet", "minimum_nights", "availability_30", "neighbourhood_cleansed", 
+                      "availability_60", "number_of_reviews", "review_scores_rating", "reviews_per_month",
+                      "price", "listing_url")
+dt_subset <- airbnb[features_to_keep]
+glimpse(dt_subset)
+```
+
+# Data Cleaning
+
+We need to change some of the column types
+```{r}
+# change features to factors
+names_to_factor <- c( "property_type", "neighbourhood_cleansed", "room_type")
+dt_subset[names_to_factor] <- map(dt_subset[names_to_factor], as.factor)
+
+# make column into proper timestamp format
+dt_subset[c("host_since")] <- dt_subset[c("host_since")] %>% map(~lubridate::ymd(.x))
+
+# make price column into numeric value without characters
+dt_subset$price <- as.numeric(gsub('[$,]', '', dt_subset$price))
+
+# some zips have more than 5 digits; make it int
+dt_subset$zipcode <- strtrim(dt_subset$zipcode, 5) 
+dt_subset[c('zipcode')] <- map(dt_subset[c('zipcode')], as.integer)
+
+# count days for host_since based on Nov 21, 2019
+dt_subset$date <- strptime("2019-11-21", format="%Y-%m-%d", tz="UTC")
+dt_subset[c("date")] <- dt_subset[c("date")] %>% map(~lubridate::ymd(.x))
+dt_subset$host_since_days <- dt_subset$date - dt_subset$host_since
+
+# superhost as logical
+dt_subset <- dt_subset %>% 
+    mutate(host_is_superhost_binary = recode(host_is_superhost, 
+                      "f" = as.logical("FALSE"), 
+                      "t" = as.logical("TRUE")))
+
+```
+
+Checking for nulls in each of the columns.   
+
+`square_feet` has many nulls (98%), so we shouldn't include this as a possible feature. 
+`review_scores_rating` and `reviews_per_month` have about 17% with missing values. 
+```{r}
+colSums(is.na(dt_subset))
+
+# we'll drop a few rows that have nans for the columns listed here
+dt_subset <- dt_subset %>% 
+  drop_na(c("zipcode", "host_is_superhost", "host_since", "host_total_listings_count", 
+            "bathrooms", "bedrooms", "beds"))
+
+# we'll also drop square_feet, since pretty much every row has no value. 
+dt_subset <-subset(dt_subset, select = -c(square_feet, date, host_since, host_is_superhost))
+```
+Let's take a look at summary statistics for each of the columns:
+
+- Why is price set to 0 for some of the locations? 
+ 
+```{r}
+summary(dt_subset)
+```
+Why is minimum price set to 0? What about listings that are less than $40 a night? 
+We really should do some checking on this data. 
+
+By visiting some of the listings, some of these really are legitimate! 
+Let's get rid of any listing that has a zero price listing. 
+
+```{r}
+subset(dt_subset[c("id", "price", "listing_url")], 
+       (price < 20))
+
+dt_subset <- filter(dt_subset, price > 0)
+```
+
+What about expensive locations. Max value of $1000?
+
+Random checks indicate that some of these are errors (not actually listed as $1000 as sdated in the data).
+Should we get rid of these by removing the top 1% of listings?
+
+```{r}
+subset(dt_subset[order(-dt_subset$price), c("id", "price", "listing_url")], 
+       (price > 600))
+```
+```{r}
+dt_house <- dt_subset %>%
+    filter(property_type %in% as.character('House'))
+
+ggplot(dt_house, aes(x = 1, y = price)) +
+  geom_boxplot() +
+  geom_jitter() +
+  th + 
+  ylab("Price ($)") +
+  ggtitle("Price of House Listings",
+          subtitle = "There's a handfull of really expensive listings") 
+```
+Let's get rid of these highly priced listings by only including the top 99%-tile of listings for price
+```{r}
+dt_subset <- filter(dt_subset, price < quantile(price, 0.99))
+```
+
+Now let's see how our price data is distrbuted. 
+It's quite skewed. This indicates that a model may need to have the price transformed. 
+```{r}
+ggplot(dt_subset, aes(price)) +
+  geom_histogram(bins = 30, aes(y = ..density..), fill = "limegreen") + 
+  geom_density(alpha = 0.2, fill = "limegreen") +
+  th +
+  ggtitle("Distribution of price",
+          subtitle = "The distribution is very skewed") +
+  theme(axis.title = element_text(), axis.title.x = element_text()) +
+  geom_vline(xintercept = round(mean(dt_subset$price), 2), size = 2, linetype = 3)
+```
+
+Let's see how the distribution is with price log-transformed.  This is looking a lot more normally distrbuted now, which may help with the performance of possible models we might be running.
+```{r}
+ggplot(dt_subset, aes(price)) +
+  geom_histogram(bins = 30, aes(y = ..density..), fill = "limegreen") + 
+  geom_density(alpha = 0.2, fill = "limegreen") +
+  th +
+  ggtitle("Transformed distribution of price",
+          subtitle = expression("With" ~'log'[10] ~ "transformation of x-axis")) +
+  geom_vline(xintercept = round(mean(dt_subset$price), 2), size = 2, linetype = 3) +
+  scale_x_log10() +
+  annotate("text", x = 800, y = 0.90, label = paste("Mean price = $", paste0(round(mean(dt_subset$price), 2))),
+           color = "#000000", size = 4)
+```
+## EDA
+
+Note: Originally, I wanted to see if we could build a model based on location. I have decided to save that for a future analysis.
+
+Let's plot price per neighborhood, and removing listings where there's only a few per neighborhood cleans up the figure quite a bit. Just to see what the data looks like.
+
+There are 97 different neighborhoods in San Diego, as classified in AirBnB data. Some of these neighborhoods have a few expensive listings. 
+```{r}
+
+neighbourhood_cleansed_group <- dt_subset %>%
+  group_by(neighbourhood_cleansed) %>%
+  tally()
+
+summary(neighbourhood_cleansed_group)
+
+neighbourhood_gt_29 <- filter(neighbourhood_cleansed_group, n > 29)
+neighbourhood_gt_29 <- neighbourhood_gt_29[['neighbourhood_cleansed']]
+
+dt_subset <- dt_subset %>%
+    filter(neighbourhood_cleansed %in% as.character(neighbourhood_gt_29))
+
+ggplot(neighbourhood_cleansed_group, aes(n)) +
+    geom_histogram(bins = 50, aes(y = ..density..), fill = "limegreen") +
+    th
+```
+
+
+```{r}
+airbnb_nh <- dt_subset %>%
+  group_by(neighbourhood_cleansed) %>%
+  summarise(price = round(mean(price), 1))
+
+
+ggplot(dt_subset, aes(price)) +
+  geom_histogram(bins = 30, aes(y = ..density..), fill = "limegreen") + 
+  geom_density(alpha = 0.2, fill = "limegreen") +
+  xlab("Price ($)") + 
+  th +
+  ggtitle("Transformed distribution of price\n by neighborhood",
+          subtitle = expression("With" ~'log'[10] ~ "transformation of x-axis")) +
+  geom_vline(data = airbnb_nh, aes(xintercept = price), size = 1, linetype = 3) +
+  geom_text(data = airbnb_nh, y = 1.5, aes(x = price + 200, 
+                                           label = paste("Mean=$",price)), 
+                                           color = "black", 
+                                           size = 3) +
+  facet_wrap(~neighbourhood_cleansed) +
+  scale_x_log10()
+```
+Let's look at all the listings we have and see where most of these listings are
+```{r}
+dt_subset %>% 
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.DarkMatterNoLabels) %>% 
+  addHeatmap(lng=~longitude,
+             lat=~latitude,
+             radius = 6)
+```
+
+```{r}
+ggplot(dt_subset, aes(x = room_type, y = price)) +
+  geom_boxplot(aes(fill = room_type)) + scale_y_log10() +
+  th + 
+  xlab("Room Type") + 
+  ylab("Price ($)") +
+  ggtitle("Boxplots of price by room type",
+          subtitle = "Entire homes and apartments have the highest avg price") +
+  geom_hline(yintercept = mean(dt_subset$price), color = "black", linetype = 2) +
+  theme(legend.position = "none")
+```
+
+```{r}
+ggplot(dt_subset, aes(x = property_type, y = price)) +
+  geom_boxplot(aes(fill = property_type)) + scale_y_log10() +
+  th + 
+  xlab("Property Type") + 
+  ylab("Price ($)") +
+  ggtitle("Boxplots of price by property type",
+          subtitle = "There are a variety of room types with a large price range in San Diego") +
+  geom_hline(yintercept = mean(dt_subset$price), color = "black", linetype = 2) +
+  coord_flip() + 
+  theme(legend.position = "none") 
+```
+
+Let's focus only on entire houses
+
+```{r}
+#we do this earlier but we need to do it again because we changed subset
+dt_house <- dt_subset %>%
+    filter(property_type %in% as.character('House'))
+
+```
+
+```{r}
+ggplot(dt_house, aes(x = host_is_superhost_binary, y = price)) +
+  geom_boxplot(aes(fill = factor(room_type))) + scale_y_log10() +
+  th + 
+  xlab("host_is_superhost_binary") + 
+  ylab("Price ($)") +
+  ggtitle("Price by Superhost and Room Type for Houses",
+          subtitle = "Price does not vary by Superhost distinction") #+
+  #theme(legend.position = "none")
+```
+
+
+```{r}
+ggplot(dt_house, aes(x = neighbourhood_cleansed, y = price)) +
+  geom_boxplot(aes(fill = neighbourhood_cleansed)) + scale_y_log10() +
+  th + 
+  xlab("Room Type") + 
+  ylab("Price ($)") +
+  ggtitle("Price by Neighborhood",
+          subtitle = "La Jolla and Mission Bay have higher price listings") +
+  geom_hline(yintercept = mean(dt_house$price), color = "black", linetype = 2) +
+  coord_flip() + 
+  theme(legend.position = "none") 
+```
+
+Let's prep the house-only listing data for modeling
+
+```{r}
+dt_house <-  subset(dt_house, select = c(host_total_listings_count, zipcode, accommodates, bathrooms, bedrooms, beds, 
+               minimum_nights, availability_30, availability_60, number_of_reviews, review_scores_rating, reviews_per_month, 
+               host_since_days, price) )
+
+dt_house$host_since_days <- as.numeric(dt_house$host_since_days, units="days")
+
+glimpse(dt_house)
+
+```
+
+
+```{r}
+# We split our data to a training set and a test set
+smp_size <- floor(0.7 * nrow(dt_house))
+set.seed(357)
+train_ind <- sample(seq_len(nrow(dt_house)), size = smp_size)
+train <- dt_house[train_ind, ]
+test <- dt_house[-train_ind, ]
+```
+
+
+```{r}
+p_reg1 <- lm(data=train, price~host_total_listings_count+zipcode+accommodates+bathrooms+bedrooms+beds+
+               minimum_nights+availability_30+availability_60+number_of_reviews+review_scores_rating+
+               reviews_per_month+host_since_days)
+summary(p_reg1)
+```
+
+Notice the standardized residuals are trending upward. This is a sign that the constant variance assumption has been violated. Compare this plot to the same plot for the correct model.
+```{r}
+plot(p_reg1)
+```
+
+```{r}
+train$rowid <- row.names(train)
+train[train$rowid == 4100,]
+```
+
+
+```{r}
+predictions_reg1 <- predict(p_reg1, test)
+test$predictions_reg1 <- predictions_reg1
+RMSE_reg1 <- paste(round(sqrt(mean(na.omit(test$price-predictions_reg1)^2)), digits = 2))
+adj_r_sq_reg1 <-paste(round(summary(p_reg1)$adj.r.squared, digits = 2))
+
+
+ggplot(test, aes(x=predictions_reg1, y=price)) +
+  geom_point() +
+  geom_smooth(method=lm, se=FALSE) +
+  xlab("Predicted Price ($)") + 
+  ylab("Actual Price ($)") +
+  ggtitle("Linear Model: Predicted vs Actual Prices for House Listings",
+          subtitle = (bquote(~R[adj]^2~':'~.(adj_r_sq_reg1)~'   RMSE:'~.(RMSE_reg1)))) +
+  th 
+```
+Let's do a log transform of the price. The diagnostic plots don't look too good on the previous linear model. 
+```{r}
+p_reg2 <- lm(data=train, log(price)~host_total_listings_count+zipcode+accommodates+bathrooms+bedrooms+beds+
+               minimum_nights+availability_30+availability_60+number_of_reviews+review_scores_rating+
+               reviews_per_month+host_since_days)
+```
+
+
+```{r}
+summary(p_reg2)
+```
+
+```{r}
+summ(p_reg2)
+
+```
+
+
+Plots from log-transformed price look a lot better. 
+```{r}
+plot(p_reg2)
+```
+
+```{r}
+predictions_reg2 <- predict(p_reg2, test)
+test$predictions_reg2 <- exp(predictions_reg2)
+RMSE_reg2 <- paste(round(sqrt(mean(na.omit(test$price-predictions_reg2)^2)), digits = 2))
+adj_r_sq_reg2 <-paste(round(summary(p_reg2)$adj.r.squared, digits = 2))
+
+
+ggplot(test, aes(x=predictions_reg2, y=price)) +
+  geom_point() +
+  geom_smooth(method=lm, se=FALSE) +
+  xlab("Predicted Price ($)") + 
+  ylab("Actual Price ($)") +
+  ggtitle("Linear Model ~log(price): Predicted vs Actual Prices for House Listings",
+          subtitle = (bquote(~R[adj]^2~':'~.(adj_r_sq_reg2)~'   RMSE:'~.(RMSE_reg2)))) +
+  th 
+```
+
+RMSE increased but Radj value decreased. It's likely that a few very off-target predictions are throwing off RMSE. 
+
+```{r}
+setcol <- c("host_total_listings_count","accommodates","bathrooms","bedrooms","beds",
+               "minimum_nights","availability_30","availability_60","number_of_reviews",
+               "review_scores_rating","reviews_per_month","host_since_days", "price")
+# we'll drop a few rows that have nans for the columns listed here
+dt_house_xg <-  subset(dt_house, select = setcol)
+dt_house_xg <- dt_house_xg %>% 
+  drop_na(all_of(setcol)) 
+
+# Make sure that all values are numeric type
+dt_house_xg <- sapply( dt_house_xg, as.numeric )
+
+# We split our data to a training set and a test set. Same as before
+smp_size_xg <- floor(0.7 * nrow(dt_house_xg))
+set.seed(357)
+train_ind_xg <- sample(seq_len(nrow(dt_house_xg)), size = smp_size_xg)
+train_xg <- dt_house_xg[train_ind_xg, ]
+test_xg <- dt_house_xg[-train_ind_xg, ]
+
+```
+
+Now we set up XGBoost model
+
+We run CV and based on the best_interation for lowest RMSE value, use that for nrounds in the actual training procedure. 
+
+```{r}
+# Make data into a matrix
+dtrain <- xgb.DMatrix(data=as.matrix(train_xg[,1:12]), label=train_xg[,13]) 
+dtest <- xgb.DMatrix(data=as.matrix(test_xg[,1:12]), label=test_xg[,13])
+
+params <- list(gblinear = "gbtree", objective = "reg:linear",lambda=4, 
+               alpha=3, subsample=0.2, max_depth=3, gamma=10)
+
+xgbcv <- xgb.cv( params = params, data = dtrain, nrounds = 300, nfold = 5, 
+                 showsd = T, stratified = T, print_every_n = 10, 
+                 early_stopping_rounds = 10, maximize = F, eval_metric="rmse" )
+
+cv_nrounds <- xgbcv$best_iteration
+
+xgb1 <- xgb.train (params = params, data = dtrain, nrounds = cv_nrounds, 
+                   watchlist = list(val=dtest,train=dtrain), print_every_n = 10, 
+                   early_stopping_rounds = 10, maximize = F, eval_metric="rmse" )
+
+xgbpred <- predict (xgb1,dtest)
+```
+
+
+```{r}
+df_xgb = data.frame( predicted = xgbpred, actual = test_xg[,13] )
+RMSE_xgb <- paste("RMSE:", round(sqrt(mean(na.omit(test_xg[,13]-xgbpred)^2)), digits = 2))
+
+ggplot(df_xgb, aes(x=predicted, y=actual)) +
+  geom_point() +
+  geom_smooth(method=lm, se=FALSE) +
+  xlab("Predicted Price ($)") + 
+  ylab("Actual Price ($)") +
+  ggtitle("XGBoost: Predicted vs Actual Prices for House Listings",
+          subtitle = (paste0(RMSE_xgb))) +
+  th 
+```
+
+
+
+```{r}
+importance <- xgb.importance( model = xgb1)
+xgb.plot.importance(importance_matrix = importance)
+```
+
